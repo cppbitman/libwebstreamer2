@@ -24,6 +24,9 @@ using json = nlohmann::json;
 GST_DEBUG_CATEGORY_STATIC(my_category);
 #define GST_CAT_DEFAULT my_category
 
+#define HLSTREAM_JOINT_LOCK(hls)    (((hls)->joint_mutex_).lock())
+#define HLSTREAM_JOINT_UNLOCK(hls)  (((hls)->joint_mutex_).unlock())
+
 HLStream::HLStream(const std::string &name, WebStreamer *ws)
     : IApp(name, ws)
     , performer_(NULL)
@@ -51,18 +54,28 @@ bool HLStream::Initialize(Promise *promise)
 }
 
 bool HLStream::Destroy(Promise *promise)
-{   
+{ 
+    bool ret = true;  
     if ( fake_pad_video_tee_ ) {
         gst_element_release_request_pad(video_tee_, fake_pad_video_tee_);
+        gst_object_unref(fake_pad_video_tee_);
         fake_pad_video_tee_ = NULL;
     }
     if ( fake_pad_audio_tee_ ) {
         gst_element_release_request_pad(audio_tee_, fake_pad_audio_tee_);
+        gst_object_unref(fake_pad_audio_tee_);
         fake_pad_audio_tee_ = NULL;
     }
-    //FIXME : other destroys
+
+    for(auto handle : joint_handles_)
+    {
+        GST_DEBUG("----------------------");
+        ret = ret && remove_pipejoint_handle(handle);
+    }
+    joint_handles_.clear();
+
     IApp::Destroy(promise);
-    return true;
+    return ret;
 }
 /////////////////////////////////////////////////////////////////////////////////////////
 void HLStream::On(Promise *promise)
@@ -225,6 +238,8 @@ bool HLStream::add_fake_endpoint(bool video)
         gst_object_unref(sinkpad);
 
         video_added = true;
+
+        GST_INFO("[hlstream: %s] fake video endpoint added!", uname().c_str());
     } 
     
     if(!audio_added && !video) {//audio
@@ -239,6 +254,10 @@ bool HLStream::add_fake_endpoint(bool video)
         GstPad *sinkpad = gst_element_get_static_pad(queue, "sink");
         g_return_val_if_fail( gst_pad_link(fake_pad_audio_tee_, sinkpad) == GST_PAD_LINK_OK , false );
         gst_object_unref(sinkpad);
+
+        audio_added = true;
+
+        GST_INFO("[hlstream: %s] fake audio endpoint added!", uname().c_str());
     }
 
     return true;
@@ -253,13 +272,13 @@ bool HLStream::on_add_endpoint(IEndpoint *endpoint)
                 GstElement *parse = gst_bin_get_by_name(GST_BIN(pipeline()), "video_parse");
                 g_warn_if_fail(parse);
                 g_warn_if_fail(gst_element_link(parse, video_tee_));
-                g_warn_if_fail(add_fake_endpoint(true));
+                //g_warn_if_fail(add_fake_endpoint(true));
             }
             if ( !audio_encoding().empty() ) {
                 GstElement *parse = gst_bin_get_by_name(GST_BIN(pipeline()), "audio_parse");
                 g_warn_if_fail(parse);
                 g_warn_if_fail(gst_element_link(parse, audio_tee_));
-                g_warn_if_fail(add_fake_endpoint(false));
+                //g_warn_if_fail(add_fake_endpoint(false));
             }
         }
         break;
@@ -271,6 +290,16 @@ bool HLStream::on_add_endpoint(IEndpoint *endpoint)
     return true;
 }
 
+/**
+ * remove_audience
+ * {//meta
+ *   "action" : "remove_audience"
+ * }
+ * {//data
+ *   "name"               : "audience_1"
+ *   //FIXME other properties
+ * }
+ */
 void HLStream::remove_audience(Promise *promise)
 {
     const json &j = promise->data();
@@ -329,4 +358,105 @@ void HLStream::Stop(Promise *promise)
     audiences_.clear();
 
     promise->resolve();
+}
+
+void HLStream::add_pipe_joint(GstElement *upstream_joint)
+{
+    HLSTREAM_JOINT_LOCK(this);
+    gchar *media_type = (gchar *)g_object_get_data(G_OBJECT(upstream_joint), "media-type");
+    GstPad *srcpad = NULL;
+    if ( g_str_equal(media_type, "video") ) {
+        GstPadTemplate *templ = gst_element_get_pad_template(video_tee_, "src_%u");
+        srcpad = gst_element_request_pad(video_tee_, templ, NULL, NULL);
+    } else 
+    if( g_str_equal(media_type, "audio") ) {
+        GstPadTemplate *templ = gst_element_get_pad_template(audio_tee_, "src_%u");
+        srcpad = gst_element_request_pad(audio_tee_, templ, NULL, NULL);
+    }
+    g_return_if_fail( srcpad != NULL );
+    
+    GST_DEBUG("[hlstream: %s] add pipe joint: %s", uname().c_str(), media_type);
+    
+    //gst_element_set_locked_state(upstream_joint, TRUE);
+    g_warn_if_fail( gst_bin_add( GST_BIN(pipeline()), upstream_joint ) );
+    
+    GstPad *sinkpad = gst_element_get_static_pad(upstream_joint, "sink");
+    g_warn_if_fail( gst_pad_link(srcpad, sinkpad) == GST_PAD_LINK_OK );
+    gst_object_unref(sinkpad);
+    
+    //gst_element_set_locked_state(upstream_joint, FALSE);
+    gst_element_sync_state_with_parent (upstream_joint);
+    
+    
+    joint_handles_.push_back(new PipeJointHandle(srcpad, upstream_joint, this));
+    HLSTREAM_JOINT_UNLOCK(this);
+}
+
+void HLStream::remove_pipe_joint(GstElement *upstream_joint)
+{
+    HLSTREAM_JOINT_LOCK(this);
+    PipeJointHandle *handle = NULL;
+    
+    auto it = std::find_if(joint_handles_.begin(), joint_handles_.end(), 
+                           [&upstream_joint](PipeJointHandle *h){
+                               return h->upstream_joint == upstream_joint;
+                           });
+    if(it != joint_handles_.end()) {
+        handle = *it;
+        joint_handles_.erase(it);
+    }
+    HLSTREAM_JOINT_UNLOCK(this);
+    g_return_if_fail(handle != NULL);
+
+    GST_DEBUG("[hlstream: %s] remove pipe joint", uname().c_str());
+
+    gst_pad_add_probe(handle->tee_srcpad, GST_PAD_PROBE_TYPE_IDLE, 
+                      on_tee_srcpad_remove_probe, handle, NULL);
+}
+
+GstPadProbeReturn HLStream::on_tee_srcpad_remove_probe(GstPad *srcpad, 
+                                                       GstPadProbeInfo *probe_info,
+                                                       gpointer joint_handle)
+{
+    PipeJointHandle *handle = static_cast<PipeJointHandle *>(joint_handle);
+    g_return_val_if_fail(handle->tee_srcpad == srcpad, GST_PAD_PROBE_OK);
+
+    HLStream * pipeline = static_cast<HLStream *>(handle->pipeline);
+    bool ret = pipeline->remove_pipejoint_handle(handle);
+    g_return_val_if_fail(ret, GST_PAD_PROBE_OK);
+
+    GST_DEBUG("[hlstream: %s] on_tee_srcpad_remove_probe", pipeline->uname().c_str());
+
+    return GST_PAD_PROBE_REMOVE;
+}
+
+bool HLStream::remove_pipejoint_handle(PipeJointHandle *handle)
+{
+    GstElement *tee = NULL;
+    gchar *media_type = (gchar *)g_object_get_data(G_OBJECT(handle->upstream_joint), "media-type");
+    
+    if ( g_str_equal(media_type, "video") ) {
+        tee = this->video_tee_;
+    } else 
+    if( g_str_equal(media_type, "audio") ) {
+        tee = this->audio_tee_;
+    }
+    g_return_val_if_fail(tee != NULL , false);
+    GST_DEBUG("====audio(%p)=video(%p)=====tee:%p=========%s",this->audio_tee_, this->video_tee_, tee, media_type);
+    //gst_element_set_locked_state(handle->upstream_joint, TRUE);
+    GstPad *sinkpad = gst_element_get_static_pad(handle->upstream_joint, "sink");
+    g_warn_if_fail(gst_pad_unlink(handle->tee_srcpad, sinkpad));
+    gst_object_unref(sinkpad);
+    gst_element_set_state(handle->upstream_joint, GST_STATE_NULL);
+    //gst_element_set_locked_state(handle->upstream_joint, FALSE);
+    g_warn_if_fail(gst_bin_remove(GST_BIN(this->pipeline()), handle->upstream_joint));
+
+    gst_element_release_request_pad(tee, handle->tee_srcpad);
+    gst_object_unref(handle->tee_srcpad);
+    delete handle;
+
+    GST_DEBUG("[hlstream: %s] pipe joint removed (%s)", uname().c_str(), media_type);
+    g_free(media_type);
+
+    return true;
 }

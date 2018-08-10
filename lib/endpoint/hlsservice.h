@@ -17,7 +17,7 @@
 #ifndef _LIBWEBSTREAMER_ENDPOINT_HLS_SERVICE_H_
 #define _LIBWEBSTREAMER_ENDPOINT_HLS_SERVICE_H_
 
-#include <framework/endpoint.h>
+#include <framework/app.h>
 #include <utils/pipejoint.h>
 
 class HLSService : public IEndpoint
@@ -30,10 +30,13 @@ public:
 
 private:
     GstElement *pipeline_;
+    GstElement *hlssink2_;//cushlssink2
+
+    GstPad *hlssink2_video_;
+    GstPad *hlssink2_audio_;
+
     PipeJoint video_joint_;
     PipeJoint audio_joint_;
-
-    GstElement *hlssink2_;//cushlssink2
 };
 
 #endif

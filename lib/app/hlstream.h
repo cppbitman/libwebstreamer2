@@ -18,6 +18,21 @@
 #define _LIBWEBSTREAMER_APP_HLS_STREAM_H_
 
 #include <framework/app.h>
+#include <mutex>
+
+struct PipeJointHandle
+{
+    IApp *pipeline;
+    GstPad *tee_srcpad;
+    GstElement *upstream_joint;
+
+    PipeJointHandle(GstPad *srcpad, GstElement *joint, IApp *pipe)
+        : upstream_joint(joint)
+        , tee_srcpad(srcpad)
+        , pipeline(pipe)
+    {
+    }
+};
 
 class HLStream : public IApp
 {
@@ -45,6 +60,13 @@ private:
     bool add_fake_endpoint(bool video);
     std::list<IEndpoint *>::iterator
         find_audience(const std::string &name);
+    
+    static GstPadProbeReturn
+    on_tee_srcpad_remove_probe(GstPad *srcpad, 
+                               GstPadProbeInfo *probe_info,
+                               gpointer joint_handle);
+    
+    bool remove_pipejoint_handle(PipeJointHandle *handle);
 
 private:
     GstElement *video_tee_;
@@ -55,6 +77,8 @@ private:
     
     IEndpoint *performer_;
     std::list<IEndpoint *> audiences_;
+    std::list<PipeJointHandle *> joint_handles_;
+    std::mutex joint_mutex_;
 };
 
 #endif

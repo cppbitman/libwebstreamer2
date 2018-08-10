@@ -48,6 +48,7 @@ bool FileSource::initialize(Promise *promise)
     IEndpoint::protocol() = "filesource";
 
     filesrc_ = gst_element_factory_make("filesrc", "filesrc");
+    g_warn_if_fail(filesrc_);
     g_object_set(G_OBJECT(filesrc_), "location", url.c_str(), NULL);
 
     if ( j.find("video_codec") != j.end() ) {
@@ -74,6 +75,7 @@ void FileSource::on_demux_pad_added(GstElement* demux, GstPad* src_pad, gpointer
             GstPad *sink_pad = gst_element_get_static_pad(file_source->video_queue_, "sink");
             g_warn_if_fail( gst_pad_link(src_pad, sink_pad) == GST_PAD_LINK_OK );
             gst_object_unref(sink_pad);
+            GST_DEBUG("[filesource :%s] video demux-queue link", file_source->name().c_str());
         }
     } 
     else if (g_str_equal(g_value_get_string(media_type), "audio")) {
@@ -81,6 +83,7 @@ void FileSource::on_demux_pad_added(GstElement* demux, GstPad* src_pad, gpointer
             GstPad *sink_pad = gst_element_get_static_pad(file_source->audio_queue_, "sink");
             g_warn_if_fail( gst_pad_link(src_pad, sink_pad) == GST_PAD_LINK_OK );
             gst_object_unref(sink_pad);
+             GST_DEBUG("[filesource :%s] audio demux-queue link", file_source->name().c_str());
         }
     } 
     else {
